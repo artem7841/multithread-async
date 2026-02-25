@@ -18,34 +18,41 @@ namespace ClusterClient.Clients
         {
             
             var partTimeout = timeout / ReplicaAddresses.Length;
+            var globalTimeout = Task.Delay(timeout);
             
             foreach (var replicaAddress in ReplicaAddresses)
             {
-                try
-                {
-                    var timeoutTask = Task.Delay(partTimeout);
-                    var webRequest = CreateRequest(replicaAddress + "?query=" + query);
-                    Log.InfoFormat($"Processing {webRequest.RequestUri}");
-                    var replicaTask = ProcessRequestAsync(webRequest);
-                    var resultTask = await Task.WhenAny(replicaTask, timeoutTask);
+                var timeoutTask = Task.Delay(partTimeout);
+                var webRequest = CreateRequest(replicaAddress + "?query=" + query);
+                Log.InfoFormat($"Processing {webRequest.RequestUri}");
+                var replicaTask = ProcessRequestAsync(webRequest);
+                var resultTask = await Task.WhenAny(replicaTask, timeoutTask);
 
-                    if (resultTask == timeoutTask)
-                        continue;
-                    else
-                    {
-                        if (ReplicaAddresses.Last() == replicaAddress)
-                            return await replicaTask;
-                        await resultTask;
-                        continue;
-                    }
-                }
-                catch (Exception e)
-                {
+                if (resultTask == timeoutTask)
                     continue;
-                }
+                    
+                if(resultTask.IsFaulted)
+                    continue;
+                    
+                if (ReplicaAddresses.Last() == replicaAddress)
+                    return await replicaTask;
+                    
+                await resultTask;
             }
             
-            throw new TimeoutException();
+            var webRequestLast = CreateRequest(ReplicaAddresses.Last() + "?query=" + query);
+            Log.InfoFormat($"Processing {webRequestLast.RequestUri}");
+            var replicaLastTask = ProcessRequestAsync(webRequestLast);
+            var resultLastTask = await Task.WhenAny(replicaLastTask, globalTimeout);
+            
+            if (resultLastTask == globalTimeout)
+            {
+                throw new TimeoutException();
+            }
+            else
+            {
+                return await replicaLastTask;
+            }
         }
 
         protected override ILog Log => LogManager.GetLogger(typeof(RoundRobinClusterClient));
