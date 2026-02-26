@@ -10,18 +10,27 @@ namespace ClusterClient.Clients
 {
     public class RoundRobinClusterClient : ClusterClientBase
     {
+        private readonly Dictionary<string, Queue<double>> stats = new ();
+        private readonly object lockObj = new ();
+        
         public RoundRobinClusterClient(string[] replicaAddresses) : base(replicaAddresses)
         {
+            foreach (var address in replicaAddresses)
+                stats[address] = new Queue<double>();
         }
 
         public override async Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
         {
-            
-            var partTimeout = timeout / ReplicaAddresses.Length;
+            var orderedReplicas = ReplicaAddresses
+                .OrderBy(GetAverage)
+                .ToArray();
+
+            var partTimeout = timeout / orderedReplicas.Length;
             var globalTimeout = Task.Delay(timeout);
             
-            foreach (var replicaAddress in ReplicaAddresses)
+            foreach (var replicaAddress in orderedReplicas)
             {
+                var startTime = DateTime.UtcNow;
                 var timeoutTask = Task.Delay(partTimeout);
                 var webRequest = CreateRequest(replicaAddress + "?query=" + query);
                 Log.InfoFormat($"Processing {webRequest.RequestUri}");
@@ -33,25 +42,44 @@ namespace ClusterClient.Clients
                     
                 if(resultTask.IsFaulted)
                     continue;
-                    
-                if (ReplicaAddresses.Last() == replicaAddress)
-                    return await replicaTask;
-                    
-                await resultTask;
+                
+                var result = await replicaTask;
+                UpdateStatistics(replicaAddress, DateTime.UtcNow - startTime);
+                return result;
             }
             
-            var webRequestLast = CreateRequest(ReplicaAddresses.Last() + "?query=" + query);
+            var lastReplica = orderedReplicas.Last();
+            var webRequestLast = CreateRequest(lastReplica + "?query=" + query);
             Log.InfoFormat($"Processing {webRequestLast.RequestUri}");
+
+            var startLast = DateTime.UtcNow;
             var replicaLastTask = ProcessRequestAsync(webRequestLast);
+
             var resultLastTask = await Task.WhenAny(replicaLastTask, globalTimeout);
-            
+
             if (resultLastTask == globalTimeout)
-            {
                 throw new TimeoutException();
-            }
-            else
+
+            var resultFinal = await replicaLastTask;
+            UpdateStatistics(lastReplica, DateTime.UtcNow - startLast);
+            return resultFinal;
+        }
+        
+        private double GetAverage(string replica)
+        {
+            lock (lockObj)
             {
-                return await replicaLastTask;
+                var queue = stats[replica];
+                return queue.Count == 0 ? double.MaxValue : queue.Average();
+            }
+        }
+        
+        private void UpdateStatistics(string replica, TimeSpan time)
+        {
+            lock (lockObj)
+            {
+                var queue = stats[replica];
+                queue.Enqueue(time.TotalMilliseconds);
             }
         }
 
